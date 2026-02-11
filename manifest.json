@@ -1,0 +1,21 @@
+[
+    {
+        "name": "True Shuffle",
+        "description": "Replaces Spotify's biased shuffle with a weighted random algorithm. Features artist spacing, no-repeat protection, back/forward navigation, and Smart Shuffle compatibility.",
+        "preview": "preview.svg",
+        "main": "true-shuffle.js",
+        "readme": "README.md",
+        "branch": "main",
+        "authors": [
+            {
+                "name": "Basthy28",
+                "url": "https://github.com/Basthy28"
+            }
+        ],
+        "tags": [
+            "shuffle",
+            "playback",
+            "smart-shuffle"
+        ]
+    }
+]
