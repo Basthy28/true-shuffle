@@ -285,16 +285,27 @@
         isHandlingAction = true;
 
         try {
+            isNativePassSkip = false;
+
+            const currentProgress = Spicetify.Player.getProgress() || 0;
+            if (currentProgress > 3000) {
+                await Spicetify.Player.seek(0);
+                return;
+            }
+
             if (navigationIndex > 0) {
-                navigationIndex--;
-                const prevUri = navigationHistory[navigationIndex];
-                await playTrackInContext(prevUri);
+                const prevUri = navigationHistory[navigationIndex - 1];
+                const ok = await playTrackInContext(prevUri);
+                if (ok) {
+                    navigationIndex--;
+                }
             } else {
-                Spicetify.Player.seek(0);
+                await Spicetify.Player.seek(0);
             }
         } catch (err) {
+            console.error("[true-shuffle] Error in skip back:", err);
         } finally {
-            setTimeout(() => { isHandlingAction = false; }, 1500);
+            isHandlingAction = false;
         }
     }
 
@@ -367,8 +378,10 @@
         const currentUri = Spicetify.Player.data?.item?.uri;
         const contextUri = getContextUri();
 
-        // Guard: if we're currently handling an action, ignore
-        if (isHandlingAction) return;
+        // Capture end-of-song state before resetting it to avoid state leakage to the next song
+        const wasNearEnd = lastDuration > 0 && (lastDuration - lastProgress) < 5000;
+        lastDuration = 0;
+        lastProgress = 0;
 
         // Native pass-through: record the track that Spotify picked
         if (isNativePassSkip) {
@@ -433,12 +446,9 @@
         // This means the song ended naturally (not a user skip)
         if (!isInTrueShuffleMode()) return;
 
-        const wasNearEnd = lastDuration > 0 && (lastDuration - lastProgress) < 5000;
         if (wasNearEnd) {
             handleSkipForward();
         }
-        // If not near end: this was a skip we didn't catch. Let Spotify's pick play
-        // (no double-skip — we simply don't override it)
     });
 
     // ===== Topbar Button =====
