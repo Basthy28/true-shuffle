@@ -1,6 +1,6 @@
 // True Shuffle — Smart weighted shuffle for Spotify
-// Replaces Spotify's biased shuffle with weighted random + artist spacing
-// Works automatically when Spotify's shuffle button is active
+// Interceptor-Free Architecture (Native Queue Fallback)
+// Ensures perfectly stable playback transitions without intercepting DOM clicks.
 
 (async function trueShuffle() {
     // Wait for Spicetify APIs
@@ -8,48 +8,60 @@
         await new Promise(r => setTimeout(r, 200));
     }
 
-    // ===== Configuration =====
     const CONFIG = {
         HISTORY_SIZE: 500,
-        NO_REPEAT_WINDOW: 100,   // Hard-exclude tracks played within last N songs
+        NO_REPEAT_WINDOW: 100,
         MIN_WEIGHT: 0.05,
         RECENCY_DECAY_RATE: 0.15,
         ARTIST_PENALTY: 0.15,
         ARTIST_SPACING: 2,
-        TRUE_SHUFFLE_EVERY: 3,   // True Shuffle picks every Nth skip; others pass to Spotify native
+        TRUE_SHUFFLE_EVERY: 3,
     };
 
-    // ===== State =====
-    let playHistory = [];              // For weighted scoring
-    let navigationHistory = [];        // For back/forward navigation
-    let navigationIndex = -1;
+    let playHistory = [];
     let currentPlaylistUri = null;
     let currentPlaylistTracks = null;
     let isActive = true;
-    let skipCounter = 0;               // Counts skips for native pass-through
-    let isNativePassSkip = false;      // Flag: current skip is a native pass-through
+    let skipCounter = 0;
 
-    // Guards against double-firing
-    let isHandlingAction = false;      // Synchronous re-entry guard
-    let lastPlayedByUsUri = null;      // URI-based songchange guard
+    let isHandlingAction = false;
+    let lastKnownPlaylistUri = null;
+    let lastPlayedByUsUri = null;
 
-    // References to original skip functions (set in monkey-patch section)
     let origSkipToNextFn = null;
-
-    // Smooth skip: mute during transition, restore after
+    let isNativePassSkip = false;
+    let nativeSkipRetryCount = 0;
     let savedVolume = null;
     let smoothSkipMuted = false;
 
-    // Progress tracking for end-of-track detection
+    // Track progress to mimic natural transitions
     let lastProgress = 0;
     let lastDuration = 0;
 
-    // ===== Helpers =====
+    function isSmartShuffleTrack() {
+        try {
+            const el = document.querySelector('.main-trackInfo-enhanced svg title, .main-trackInfo-xsmallBadges svg title');
+            if (el && el.textContent.includes('Smart Shuffle')) {
+                return true;
+            }
+        } catch (e) { }
+        return false;
+    }
 
     function isInTrueShuffleMode() {
-        return isActive &&
-            Spicetify.Player.getShuffle() &&
-            getContextUri()?.startsWith("spotify:playlist:");
+        try {
+            if (!isActive) return false;
+
+            const isSmart = isSmartShuffleTrack();
+            const isShuffleOn = Spicetify?.Player?.getShuffle ? Spicetify.Player.getShuffle() : false;
+
+            const contextUri = getContextUri();
+            const contextIsGood = (contextUri && contextUri.startsWith("spotify:playlist:")) || !!lastKnownPlaylistUri || isSmart;
+
+            return (isShuffleOn || isSmart) && contextIsGood;
+        } catch (err) {
+            return false;
+        }
     }
 
     function getContextUri() {
@@ -59,8 +71,6 @@
             return null;
         }
     }
-
-    // ===== Weighted Random Algorithm =====
 
     function calculateWeight(track, history) {
         let weight = 1.0;
@@ -83,13 +93,11 @@
         if (!tracks || tracks.length === 0) return null;
         if (tracks.length === 1) return tracks[0];
 
-        // Hard-exclude tracks played within NO_REPEAT_WINDOW
         const recentUris = new Set(
             history.slice(0, CONFIG.NO_REPEAT_WINDOW).map(h => h.uri)
         );
         let candidates = tracks.filter(t => !recentUris.has(t.uri));
 
-        // Fallback: if all tracks are excluded, reset
         if (candidates.length === 0) {
             candidates = tracks;
         }
@@ -110,24 +118,23 @@
         return weighted[weighted.length - 1].track;
     }
 
-    // ===== Playlist Loading =====
-
     async function loadPlaylistTracks(contextUri) {
         if (!contextUri || !contextUri.startsWith("spotify:playlist:")) return null;
 
         try {
-            const contents = await Spicetify.Platform.PlaylistAPI.getContents(contextUri);
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout Requesting Tracks")), 1000));
+            const contents = await Promise.race([
+                Spicetify.Platform.PlaylistAPI.getContents(contextUri),
+                timeoutPromise
+            ]);
+
             if (!contents?.items) return null;
 
             const tracks = [];
 
             for (const item of contents.items) {
                 if (!item.uri || item.type !== "track") continue;
-
-                // Skip unplayable tracks to prevent player crashes
-                if (item.isPlayable === false) {
-                    continue;
-                }
+                if (item.isPlayable === false) continue;
 
                 tracks.push({
                     uri: item.uri,
@@ -139,71 +146,48 @@
 
             return tracks;
         } catch (err) {
-            console.error("[true-shuffle] Error loading playlist:", err);
             return null;
         }
     }
 
     async function ensurePlaylistLoaded() {
-        const contextUri = getContextUri();
-        if (!contextUri) return false;
+        try {
+            if (currentPlaylistTracks && currentPlaylistTracks.length > 0) {
+                return true;
+            }
 
-        if (contextUri !== currentPlaylistUri || !currentPlaylistTracks) {
-            currentPlaylistUri = contextUri;
-            currentPlaylistTracks = await loadPlaylistTracks(contextUri);
+            const contextUri = getContextUri() || lastKnownPlaylistUri;
+            if (!contextUri) {
+                return false;
+            }
+
+            if (contextUri !== currentPlaylistUri || !currentPlaylistTracks) {
+                currentPlaylistUri = contextUri;
+                lastKnownPlaylistUri = contextUri;
+                const tracks = await loadPlaylistTracks(contextUri);
+                if (tracks && tracks.length > 0) {
+                    currentPlaylistTracks = tracks;
+                }
+            }
+            return !!(currentPlaylistTracks && currentPlaylistTracks.length > 0);
+        } catch (e) {
+            return false;
         }
-        return !!(currentPlaylistTracks && currentPlaylistTracks.length > 0);
     }
-
-    // ===== History Management =====
 
     function recordCurrentTrack() {
         const currentTrack = Spicetify.Player.data?.item;
         if (!currentTrack?.uri) return;
+
+        if (isSmartShuffleTrack()) {
+            return;
+        }
 
         const artistUri = currentTrack.metadata?.artist_uri || null;
         playHistory = playHistory.filter(h => h.uri !== currentTrack.uri);
         playHistory.unshift({ uri: currentTrack.uri, artistUri });
         if (playHistory.length > CONFIG.HISTORY_SIZE) {
             playHistory = playHistory.slice(0, CONFIG.HISTORY_SIZE);
-        }
-    }
-
-    function pushToNavigation(uri) {
-        if (!uri) return;
-        // If we navigated back and now play a new track, truncate forward history
-        if (navigationIndex < navigationHistory.length - 1) {
-            navigationHistory = navigationHistory.slice(0, navigationIndex + 1);
-        }
-        navigationHistory.push(uri);
-        navigationIndex = navigationHistory.length - 1;
-
-        if (navigationHistory.length > CONFIG.HISTORY_SIZE) {
-            navigationHistory = navigationHistory.slice(navigationHistory.length - CONFIG.HISTORY_SIZE);
-            navigationIndex = navigationHistory.length - 1;
-        }
-    }
-
-    // ===== Play a specific track in the playlist context =====
-
-    async function playTrackInContext(trackUri) {
-        const contextUri = getContextUri();
-        if (!contextUri) return false;
-
-        try {
-            lastPlayedByUsUri = trackUri;
-            await Spicetify.Platform.PlayerAPI.play(
-                { uri: contextUri },
-                {},
-                { skipTo: { uri: trackUri } }
-            );
-            // Restore volume after track starts
-            restoreVolume();
-            return true;
-        } catch (err) {
-            lastPlayedByUsUri = null;
-            restoreVolume();
-            return false;
         }
     }
 
@@ -223,96 +207,80 @@
         }
     }
 
-    // ===== Core Actions =====
+    // NATIVE CONTEXT PLAY (V2)
+    async function playTrackInContext(trackUri) {
+        const contextUri = getContextUri() || lastKnownPlaylistUri;
+        if (!contextUri) {
+            return false;
+        }
+
+        try {
+            lastPlayedByUsUri = trackUri;
+
+            const playPromise = Spicetify.Platform.PlayerAPI.play(
+                { uri: contextUri },
+                {},
+                { skipTo: { uri: trackUri } }
+            );
+
+            // Time out play request to prevent infinite freeze in Spicetify
+            await Promise.race([
+                playPromise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500))
+            ]);
+
+            restoreVolume();
+            return true;
+        } catch (err) {
+            lastPlayedByUsUri = null;
+            restoreVolume();
+            return false;
+        }
+    }
 
     async function handleSkipForward() {
-        // Synchronous re-entry guard — prevents double-skip
         if (isHandlingAction) return;
         isHandlingAction = true;
+
+        const failsafeId = setTimeout(() => {
+            isHandlingAction = false;
+        }, 3500);
 
         try {
             if (!(await ensurePlaylistLoaded())) return;
 
             recordCurrentTrack();
 
-            // If we're in the middle of nav history, go forward
-            if (navigationIndex < navigationHistory.length - 1) {
-                navigationIndex++;
-                const nextUri = navigationHistory[navigationIndex];
-                const ok = await playTrackInContext(nextUri);
-                if (!ok) {
-                    navigationIndex--;
-                } else {
-                    return;
-                }
-            }
-
-            // Native pass-through: let Spotify handle some skips
-            // Smart Shuffle suggestions may appear on these native skips
             skipCounter++;
             if (skipCounter % CONFIG.TRUE_SHUFFLE_EVERY !== 0) {
                 isNativePassSkip = true;
-                isHandlingAction = false; // Release guard BEFORE native skip
+                clearTimeout(failsafeId);
+                isHandlingAction = false;
                 muteForSkip();
                 setTimeout(() => origSkipToNextFn(), 50);
                 return;
             }
 
-            // True Shuffle pick — weighted random
             for (let attempt = 0; attempt < 3; attempt++) {
                 const nextTrack = pickNextTrack(currentPlaylistTracks, playHistory);
                 if (!nextTrack) return;
 
                 const ok = await playTrackInContext(nextTrack.uri);
                 if (ok) {
-                    pushToNavigation(nextTrack.uri);
                     return;
                 }
 
-                // Track failed to play — add to history so we skip it next time
                 playHistory.unshift({ uri: nextTrack.uri, artistUri: nextTrack.artistUri });
             }
 
         } catch (err) {
         } finally {
-            // Keep the guard up long enough for songchange events to settle
-            setTimeout(() => { isHandlingAction = false; }, 1500);
+            clearTimeout(failsafeId);
+            setTimeout(() => { isHandlingAction = false; }, 1000);
         }
     }
 
-    async function handleSkipBack() {
-        if (isHandlingAction) return;
-        isHandlingAction = true;
-
-        try {
-            isNativePassSkip = false;
-
-            const currentProgress = Spicetify.Player.getProgress() || 0;
-            if (currentProgress > 3000) {
-                await Spicetify.Player.seek(0);
-                return;
-            }
-
-            if (navigationIndex > 0) {
-                const prevUri = navigationHistory[navigationIndex - 1];
-                const ok = await playTrackInContext(prevUri);
-                if (ok) {
-                    navigationIndex--;
-                }
-            } else {
-                await Spicetify.Player.seek(0);
-            }
-        } catch (err) {
-            console.error("[true-shuffle] Error in skip back:", err);
-        } finally {
-            isHandlingAction = false;
-        }
-    }
-
-    // ===== Intercept skip at BOTH API levels =====
-    // Spotify UI buttons may call PlayerAPI directly, bypassing Player.next()
-
-    // Level 1: Spicetify.Player.next / back
+    // Intercept native skips safely (No DOM Interceptor)
     const origPlayerNext = Spicetify.Player.next.bind(Spicetify.Player);
     Spicetify.Player.next = () => {
         if (isInTrueShuffleMode()) {
@@ -323,20 +291,9 @@
         origPlayerNext();
     };
 
-    const origPlayerBack = Spicetify.Player.back.bind(Spicetify.Player);
-    Spicetify.Player.back = () => {
-        if (isInTrueShuffleMode()) {
-            handleSkipBack();
-            return;
-        }
-        origPlayerBack();
-    };
-
-    // Level 2: Spicetify.Platform.PlayerAPI.skipToNext / skipToPrevious
     if (Spicetify.Platform?.PlayerAPI?.skipToNext) {
         origSkipToNextFn = Spicetify.Platform.PlayerAPI.skipToNext.bind(Spicetify.Platform.PlayerAPI);
         Spicetify.Platform.PlayerAPI.skipToNext = () => {
-            // Block during our own handling to prevent cascade errors
             if (isHandlingAction) return;
             if (isInTrueShuffleMode()) {
                 muteForSkip();
@@ -347,20 +304,6 @@
         };
     }
 
-    if (Spicetify.Platform?.PlayerAPI?.skipToPrevious) {
-        const origSkipToPrev = Spicetify.Platform.PlayerAPI.skipToPrevious.bind(Spicetify.Platform.PlayerAPI);
-        Spicetify.Platform.PlayerAPI.skipToPrevious = () => {
-            // Block during our own handling to prevent cascade errors
-            if (isHandlingAction) return;
-            if (isInTrueShuffleMode()) {
-                handleSkipBack();
-                return;
-            }
-            return origSkipToPrev();
-        };
-    }
-
-    // ===== Track progress for end-of-track detection =====
     setInterval(() => {
         try {
             lastProgress = Spicetify.Player.getProgress() || 0;
@@ -368,69 +311,51 @@
         } catch { }
     }, 1000);
 
-    // ===== Songchange listener =====
-    // Now ONLY used for: context changes + natural end-of-track auto-advance
-    // Skip actions are fully handled by the monkey-patches above
-
     let lastContextUri = null;
 
     Spicetify.Player.addEventListener("songchange", () => {
         const currentUri = Spicetify.Player.data?.item?.uri;
         const contextUri = getContextUri();
 
-        // Capture end-of-song state before resetting it to avoid state leakage to the next song
-        const wasNearEnd = lastDuration > 0 && (lastDuration - lastProgress) < 5000;
-        lastDuration = 0;
-        lastProgress = 0;
+        if (isHandlingAction) return;
 
-        // Native pass-through: record the track that Spotify picked
         if (isNativePassSkip) {
             isNativePassSkip = false;
-            if (currentUri) {
-                const trackName = Spicetify.Player.data?.item?.metadata?.title || "Unknown";
-                const artistName = Spicetify.Player.data?.item?.metadata?.artist_name || "Unknown";
 
-                // Check if this track was recently played (anti-repeat for native skips)
+            if (currentUri) {
                 const recentUris = new Set(
                     playHistory.slice(0, CONFIG.NO_REPEAT_WINDOW).map(h => h.uri)
                 );
+
                 if (recentUris.has(currentUri)) {
-                    isNativePassSkip = true;
-                    muteForSkip();
-                    setTimeout(() => origSkipToNextFn(), 50);
-                    return;
+                    if (nativeSkipRetryCount < 3) {
+                        nativeSkipRetryCount++;
+                        isNativePassSkip = true;
+                        muteForSkip();
+                        setTimeout(() => origSkipToNextFn(), 50);
+                        return;
+                    }
                 }
 
-
-                pushToNavigation(currentUri);
+                nativeSkipRetryCount = 0;
                 recordCurrentTrack();
-                restoreVolume(); // Unmute after native pick is accepted
+                restoreVolume();
             }
             return;
         }
 
-        // Guard: if this song was played by us, ignore
         if (currentUri && currentUri === lastPlayedByUsUri) {
             lastPlayedByUsUri = null;
             return;
         }
 
-        // Context change — user switched to a new playlist
         if (contextUri !== lastContextUri) {
             lastContextUri = contextUri;
             currentPlaylistUri = null;
             currentPlaylistTracks = null;
             skipCounter = 0;
             playHistory = [];
-            navigationHistory = [];
-            navigationIndex = -1;
 
-            // Seed navigation with the first track
-            if (currentUri) {
-                pushToNavigation(currentUri);
-            }
-
-            // Pre-load playlist tracks
             if (contextUri?.startsWith("spotify:playlist:")) {
                 loadPlaylistTracks(contextUri).then(tracks => {
                     if (tracks) {
@@ -442,16 +367,13 @@
             return;
         }
 
-        // Auto-advance: only if the previous song was near its end
-        // This means the song ended naturally (not a user skip)
         if (!isInTrueShuffleMode()) return;
 
+        const wasNearEnd = lastDuration > 0 && (lastDuration - lastProgress) < 5000;
         if (wasNearEnd) {
             handleSkipForward();
         }
     });
-
-    // ===== Topbar Button =====
 
     const ICON_ACTIVE = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M13.151.922a.75.75 0 10-1.06 1.06L13.109 3H11.16a3.75 3.75 0 00-2.873 1.34l-6.173 7.356A2.25 2.25 0 01.39 12.5H0V14h.391a3.75 3.75 0 002.873-1.34l6.173-7.356a2.25 2.25 0 011.724-.804h1.947l-1.017 1.018a.75.75 0 001.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c1.109 0 2.16.49 2.873 1.34L4.89 5.277l-.979 1.167-1.796-2.14A2.25 2.25 0 00.39 3.5z"/><path d="M7.5 10.723l.98-1.167 1.796 2.14a2.25 2.25 0 001.724.804h1.947l-1.017-1.018a.75.75 0 111.06-1.06l2.829 2.828-2.829 2.828a.75.75 0 11-1.06-1.06L13.109 13H11.16a3.75 3.75 0 01-2.873-1.34L7.5 10.723z"/></svg>`;
     const ICON_INACTIVE = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" opacity="0.5"><path d="M13.151.922a.75.75 0 10-1.06 1.06L13.109 3H11.16a3.75 3.75 0 00-2.873 1.34l-6.173 7.356A2.25 2.25 0 01.39 12.5H0V14h.391a3.75 3.75 0 002.873-1.34l6.173-7.356a2.25 2.25 0 011.724-.804h1.947l-1.017 1.018a.75.75 0 001.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c1.109 0 2.16.49 2.873 1.34L4.89 5.277l-.979 1.167-1.796-2.14A2.25 2.25 0 00.39 3.5z"/><path d="M7.5 10.723l.98-1.167 1.796 2.14a2.25 2.25 0 001.724.804h1.947l-1.017-1.018a.75.75 0 111.06-1.06l2.829 2.828-2.829 2.828a.75.75 0 11-1.06-1.06L13.109 13H11.16a3.75 3.75 0 01-2.873-1.34L7.5 10.723z"/></svg>`;
@@ -470,6 +392,5 @@
             Spicetify.showNotification(isActive ? "True Shuffle enabled" : "True Shuffle disabled");
         }
     );
-
 
 })();
